@@ -1,0 +1,22 @@
+[package]
+name = "ai-local-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Hardware-aware control plane for local AI inference engines"
+license = "Apache-2.0"
+
+[[bin]]
+name = "airuntime"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.20"
