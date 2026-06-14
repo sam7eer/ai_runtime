@@ -1,5 +1,6 @@
 mod backend;
 mod cli;
+mod gguf;
 mod model;
 mod policy;
 mod probe;

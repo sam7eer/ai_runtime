@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 use crate::model::HardwareSnapshot;
-use crate::policy::ExecutionProfile;
+use crate::policy::PlanningDecision;
 
 pub struct Store {
     connection: Connection,
@@ -52,6 +52,19 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_profile_recommendations_snapshot
                 ON profile_recommendations(snapshot_id);
+
+            CREATE TABLE IF NOT EXISTS planning_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                model_path TEXT NOT NULL,
+                optimization_goal TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(snapshot_id) REFERENCES hardware_snapshots(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_planning_decisions_snapshot
+                ON planning_decisions(snapshot_id);
             ",
         )?;
         Ok(())
@@ -66,16 +79,22 @@ impl Store {
         Ok(self.connection.last_insert_rowid())
     }
 
-    pub fn insert_recommendation(
+    pub fn insert_planning_decision(
         &self,
         snapshot_id: i64,
-        profile: &ExecutionProfile,
+        decision: &PlanningDecision,
     ) -> Result<i64> {
-        let payload = serde_json::to_string(profile)?;
+        let payload = serde_json::to_string(decision)?;
         self.connection.execute(
-            "INSERT INTO profile_recommendations (snapshot_id, mode, payload_json)
-             VALUES (?1, ?2, ?3)",
-            params![snapshot_id, format!("{:?}", profile.mode), payload],
+            "INSERT INTO planning_decisions
+                (snapshot_id, model_path, optimization_goal, payload_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot_id,
+                decision.model.path.to_string_lossy(),
+                format!("{:?}", decision.workload.optimization_goal),
+                payload
+            ],
         )?;
         Ok(self.connection.last_insert_rowid())
     }
@@ -101,8 +120,13 @@ impl Store {
 mod tests {
     use tempfile::tempdir;
 
+    use std::path::PathBuf;
+
+    use crate::gguf::ModelMetadata;
     use crate::model::{CpuInfo, HardwareSnapshot, MemoryInfo, PowerInfo};
-    use crate::policy::{GpuOffload, RuntimeMode, recommend};
+    use crate::policy::{
+        GpuPlacement, OptimizationGoal, PlanningOverrides, UseCase, WorkloadSpec, plan,
+    };
 
     use super::Store;
 
@@ -119,8 +143,8 @@ mod tests {
                 physical_cores: Some(4),
             },
             memory: MemoryInfo {
-                total_bytes: 16,
-                available_bytes: 8,
+                total_bytes: 16 * 1024_u64.pow(3),
+                available_bytes: 8 * 1024_u64.pow(3),
                 swap_total_bytes: 0,
                 swap_free_bytes: 0,
             },
@@ -141,11 +165,38 @@ mod tests {
         let expected = snapshot();
 
         let snapshot_id = store.insert_snapshot(&expected).unwrap();
-        let profile = recommend(&expected, RuntimeMode::Balanced);
-        store.insert_recommendation(snapshot_id, &profile).unwrap();
+        let decision = plan(
+            &expected,
+            ModelMetadata {
+                path: PathBuf::from("/models/test.gguf"),
+                file_size_bytes: 1,
+                gguf_version: 3,
+                name: Some("Test".into()),
+                architecture: "llama".into(),
+                block_count: 1,
+                context_length: Some(4096),
+                embedding_length: Some(128),
+                attention_head_count: Some(1),
+                attention_head_count_kv: Some(1),
+                attention_key_length: None,
+                attention_value_length: None,
+            },
+            WorkloadSpec {
+                use_case: UseCase::Interactive,
+                optimization_goal: OptimizationGoal::Balanced,
+                prompt_tokens: 64,
+                output_tokens: 64,
+                concurrency: 1,
+            },
+            PlanningOverrides::default(),
+        )
+        .unwrap();
+        store
+            .insert_planning_decision(snapshot_id, &decision)
+            .unwrap();
         let snapshots = store.recent_snapshots(1).unwrap();
 
         assert_eq!(snapshots, vec![expected]);
-        assert_eq!(profile.gpu_offload, GpuOffload::Disabled);
+        assert_eq!(decision.selected.gpu_placement, GpuPlacement::CpuOnly);
     }
 }

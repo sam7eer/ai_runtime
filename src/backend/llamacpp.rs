@@ -4,7 +4,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::policy::{ExecutionProfile, GpuOffload};
+use crate::policy::ExecutionProfile;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LlamaCppStatus {
@@ -49,23 +49,16 @@ pub fn server_command(
         .arg(profile.context_size.to_string())
         .arg("--batch-size")
         .arg(profile.batch_size.to_string())
+        .arg("--ubatch-size")
+        .arg(profile.ubatch_size.to_string())
+        .arg("--parallel")
+        .arg(profile.parallel_slots.to_string())
         .arg("--cache-type-k")
-        .arg(&profile.kv_cache_type)
+        .arg(profile.kv_cache_type.llama_cpp_value())
         .arg("--cache-type-v")
-        .arg(&profile.kv_cache_type);
-
-    match profile.gpu_offload {
-        GpuOffload::Disabled => {
-            command.arg("--n-gpu-layers").arg("0");
-        }
-        GpuOffload::Conservative => {
-            command.arg("--n-gpu-layers").arg("16");
-        }
-        GpuOffload::MaximumFitting => {
-            // A high layer count asks llama.cpp to offload every layer that fits.
-            command.arg("--n-gpu-layers").arg("999");
-        }
-    }
+        .arg(profile.kv_cache_type.llama_cpp_value())
+        .arg("--n-gpu-layers")
+        .arg(profile.gpu_placement.llama_cpp_value());
 
     command
 }
@@ -101,21 +94,13 @@ pub fn command_args(command: &Command) -> Vec<String> {
 mod tests {
     use std::path::Path;
 
-    use crate::policy::{ExecutionProfile, GpuOffload, RuntimeMode};
+    use crate::policy::{ExecutionProfile, GpuPlacement, KvCacheType, MemoryEstimate};
 
     use super::{command_args, server_command};
 
     #[test]
     fn builds_a_server_command_from_a_profile() {
-        let profile = ExecutionProfile {
-            mode: RuntimeMode::Balanced,
-            cpu_threads: 8,
-            gpu_offload: GpuOffload::MaximumFitting,
-            context_size: 4096,
-            batch_size: 256,
-            kv_cache_type: "f16".into(),
-            reasons: vec![],
-        };
+        let profile = test_profile();
 
         let command = server_command(
             Path::new("/opt/llama-server"),
@@ -132,9 +117,50 @@ mod tests {
                 .any(|pair| pair == ["--model", "/models/test.gguf"])
         );
         assert!(args.windows(2).any(|pair| pair == ["--threads", "8"]));
+        assert!(args.windows(2).any(|pair| pair == ["--n-gpu-layers", "24"]));
+        assert!(args.windows(2).any(|pair| pair == ["--parallel", "2"]));
+    }
+
+    #[test]
+    fn preserves_backend_auto_gpu_placement() {
+        let mut profile = test_profile();
+        profile.gpu_placement = GpuPlacement::Auto;
+
+        let command = server_command(
+            Path::new("/opt/llama-server"),
+            Path::new("/models/test.gguf"),
+            "127.0.0.1",
+            8080,
+            &profile,
+        );
+        let args = command_args(&command);
+
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["--n-gpu-layers", "999"])
+                .any(|pair| pair == ["--n-gpu-layers", "auto"])
         );
+    }
+
+    fn test_profile() -> ExecutionProfile {
+        ExecutionProfile {
+            cpu_threads: 8,
+            gpu_placement: GpuPlacement::Exact { layers: 24 },
+            context_size: 4096,
+            parallel_slots: 2,
+            batch_size: 256,
+            ubatch_size: 128,
+            kv_cache_type: KvCacheType::F16,
+            memory: MemoryEstimate {
+                model_bytes: 1,
+                kv_cache_bytes: Some(1),
+                compute_buffer_bytes: 1,
+                estimated_total_bytes: Some(3),
+                estimated_gpu_bytes: Some(3),
+                system_budget_bytes: 10,
+                gpu_budget_bytes: Some(10),
+            },
+            planning_score: 1.0,
+            reasons: vec![],
+        }
     }
 }

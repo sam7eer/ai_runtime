@@ -46,6 +46,8 @@ pub struct AcceleratorInfo {
     pub vendor: String,
     pub device_path: Option<String>,
     pub dedicated_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub available_memory_bytes: Option<u64>,
     pub telemetry_available: bool,
 }
 

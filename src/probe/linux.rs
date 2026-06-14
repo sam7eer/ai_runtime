@@ -124,14 +124,19 @@ fn probe_accelerators() -> Vec<AcceleratorInfo> {
             Some(driver) => format!("{vendor} GPU {device_id} ({driver})"),
             None => format!("{vendor} GPU {device_id}"),
         };
+        let dedicated_memory_bytes = read_vram_total(&device_path);
+        let available_memory_bytes =
+            read_available_vram(&device_path, &vendor_id, dedicated_memory_bytes);
 
         accelerators.push(AcceleratorInfo {
             kind,
             name,
             vendor,
             device_path: Some(format!("/sys/class/drm/{card_name}")),
-            dedicated_memory_bytes: read_vram_total(&device_path),
-            telemetry_available: telemetry_available(&device_path, &vendor_id),
+            dedicated_memory_bytes,
+            available_memory_bytes,
+            telemetry_available: available_memory_bytes.is_some()
+                || telemetry_available(&device_path, &vendor_id),
         });
     }
 
@@ -158,6 +163,38 @@ fn read_vram_total(device_path: &Path) -> Option<u64> {
     ["mem_info_vram_total", "mem_info_vis_vram_total"]
         .iter()
         .find_map(|file| read_trimmed(device_path.join(file))?.parse().ok())
+}
+
+fn read_available_vram(
+    device_path: &Path,
+    vendor_id: &str,
+    total_bytes: Option<u64>,
+) -> Option<u64> {
+    match vendor_id {
+        "0x1002" => {
+            let total = total_bytes?;
+            let used = read_trimmed(device_path.join("mem_info_vram_used"))?
+                .parse::<u64>()
+                .ok()?;
+            Some(total.saturating_sub(used))
+        }
+        "0x10de" => nvidia_free_memory_bytes(),
+        _ => None,
+    }
+}
+
+fn nvidia_free_memory_bytes() -> Option<u64> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let output = String::from_utf8(output.stdout).ok()?;
+    let free_mib = output.lines().next()?.trim().parse::<u64>().ok()?;
+    free_mib.checked_mul(1024 * 1024)
 }
 
 fn telemetry_available(device_path: &Path, vendor_id: &str) -> bool {
