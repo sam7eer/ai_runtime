@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::backend::llamacpp::{
-    LlamaCppStatus, command_args as llama_command_args, server_command,
+    BenchmarkRun, InferenceOptions, InferenceResult, LlamaCppStatus, LlamaCppVariant,
+    command_args as llama_command_args, run_benchmark, run_inference, server_command,
 };
 use crate::gguf::{ModelMetadata, inspect as inspect_gguf};
 use crate::model::HardwareSnapshot;
@@ -79,6 +81,49 @@ enum Command {
         json: bool,
     },
 
+    /// Launch llama-server, run one prompt, record telemetry, and stop it.
+    Infer {
+        #[command(flatten)]
+        planning: PlanningArgs,
+
+        #[arg(long)]
+        prompt: String,
+
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+
+        /// Disable model reasoning through the chat-template parameters.
+        #[arg(long)]
+        disable_thinking: bool,
+
+        #[arg(long, default_value_t = 120)]
+        startup_timeout_seconds: u64,
+
+        #[arg(long, default_value_t = 300)]
+        request_timeout_seconds: u64,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Benchmark top scheduler candidates on CUDA and persist the measurements.
+    Calibrate {
+        #[command(flatten)]
+        planning: PlanningArgs,
+
+        #[arg(long, default_value_t = 3)]
+        candidates: usize,
+
+        #[arg(long, default_value_t = 3)]
+        repetitions: u32,
+
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show recently persisted hardware snapshots.
     Snapshots {
         #[arg(long, default_value_t = 5)]
@@ -141,8 +186,8 @@ pub fn run(cli: Cli) -> Result<()> {
             show_candidates,
             json,
         } => {
-            let (snapshot, decision) = create_decision(&planning)?;
-            persist_decision(&database, &snapshot, &decision)?;
+            let (snapshot, decision) = create_calibrated_decision(&planning, &database)?;
+            let _ = persist_decision(&database, &snapshot, &decision)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&decision)?);
             } else {
@@ -158,10 +203,12 @@ pub fn run(cli: Cli) -> Result<()> {
                     "llama-server: {}",
                     display_optional_path(status.server_path.as_ref())
                 );
+                println!("Server backend: {}", display_variant(status.server_variant));
                 println!(
                     "llama-bench: {}",
                     display_optional_path(status.bench_path.as_ref())
                 );
+                println!("Bench backend: {}", display_variant(status.bench_variant));
                 println!("Ready for serving: {}", status.ready_for_serving);
                 println!("Ready for benchmarking: {}", status.ready_for_benchmarking);
             }
@@ -172,8 +219,8 @@ pub fn run(cli: Cli) -> Result<()> {
             port,
             json,
         } => {
-            let (snapshot, decision) = create_decision(&planning)?;
-            persist_decision(&database, &snapshot, &decision)?;
+            let (snapshot, decision) = create_calibrated_decision(&planning, &database)?;
+            let _ = persist_decision(&database, &snapshot, &decision)?;
 
             let status = LlamaCppStatus::discover();
             let executable_found = status.server_path.is_some();
@@ -214,6 +261,115 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Infer {
+            planning,
+            prompt,
+            host,
+            port,
+            disable_thinking,
+            startup_timeout_seconds,
+            request_timeout_seconds,
+            json,
+        } => {
+            let (snapshot, decision) = create_calibrated_decision(&planning, &database)?;
+            let status = LlamaCppStatus::discover();
+            let server_path = status
+                .server_path
+                .context("llama-server was not found; set LLAMA_SERVER_PATH")?;
+            if status.server_variant != Some(LlamaCppVariant::Cuda) {
+                bail!(
+                    "the selected llama-server is not a CUDA build: {}; set LLAMA_SERVER_PATH to a CUDA build",
+                    server_path.display()
+                );
+            }
+
+            let (snapshot_id, decision_id) = persist_decision(&database, &snapshot, &decision)?;
+            let result = run_inference(&InferenceOptions {
+                server_path: &server_path,
+                model_path: &decision.model.path,
+                host: &host,
+                port,
+                profile: &decision.selected,
+                prompt: &prompt,
+                max_tokens: planning.output_tokens,
+                disable_thinking,
+                startup_timeout: Duration::from_secs(startup_timeout_seconds),
+                request_timeout: Duration::from_secs(request_timeout_seconds),
+            })?;
+            Store::open(&database)?.insert_inference_run(
+                snapshot_id,
+                decision_id,
+                &decision.model.path,
+                &result,
+            )?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_inference_result(&result);
+            }
+        }
+        Command::Calibrate {
+            planning,
+            candidates,
+            repetitions,
+            json,
+        } => {
+            if candidates == 0 {
+                bail!("candidate count must be greater than zero");
+            }
+            let (snapshot, decision) = create_decision(&planning)?;
+            let status = LlamaCppStatus::discover();
+            let bench_path = status
+                .bench_path
+                .context("llama-bench was not found; set LLAMA_BENCH_PATH")?;
+            if status.bench_variant != Some(LlamaCppVariant::Cuda) {
+                bail!(
+                    "the selected llama-bench is not a CUDA build: {}; set LLAMA_BENCH_PATH to a CUDA build",
+                    bench_path.display()
+                );
+            }
+
+            let (snapshot_id, decision_id) = persist_decision(&database, &snapshot, &decision)?;
+            let store = Store::open(&database)?;
+            let mut runs = Vec::new();
+            for profile in decision.candidates.iter().take(candidates.min(10)) {
+                let run = run_benchmark(
+                    &bench_path,
+                    &decision.model.path,
+                    profile,
+                    planning.prompt_tokens,
+                    planning.output_tokens,
+                    repetitions,
+                )?;
+                runs.push(run);
+            }
+            for run in &runs {
+                store.insert_benchmark_run(snapshot_id, decision_id, &decision.model.path, run)?;
+            }
+            runs.sort_by(|left, right| {
+                right
+                    .effective_tokens_per_second
+                    .total_cmp(&left.effective_tokens_per_second)
+            });
+            let selected = runs
+                .first()
+                .context("the scheduler produced no candidates to benchmark")?
+                .profile
+                .clone();
+            let calibration = CalibrationResult {
+                selection_basis:
+                    "measured effective throughput for the requested prompt/output token mix".into(),
+                selected,
+                runs,
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&calibration)?);
+            } else {
+                print_calibration(&calibration);
+            }
+        }
         Command::Snapshots { limit, json } => {
             let snapshots = Store::open(&database)?.recent_snapshots(limit)?;
             if json {
@@ -248,6 +404,13 @@ struct ServerPlan {
     planning_notes: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct CalibrationResult {
+    selection_basis: String,
+    selected: ExecutionProfile,
+    runs: Vec<BenchmarkRun>,
+}
+
 fn create_decision(planning: &PlanningArgs) -> Result<(HardwareSnapshot, PlanningDecision)> {
     let snapshot = capture()?;
     let model = inspect_gguf(&planning.model)?;
@@ -270,15 +433,31 @@ fn create_decision(planning: &PlanningArgs) -> Result<(HardwareSnapshot, Plannin
     Ok((snapshot, decision))
 }
 
+fn create_calibrated_decision(
+    planning: &PlanningArgs,
+    database: &Path,
+) -> Result<(HardwareSnapshot, PlanningDecision)> {
+    let (snapshot, mut decision) = create_decision(planning)?;
+    if let Some(calibration) =
+        Store::open(database)?.latest_compatible_calibration(&snapshot, &decision)?
+    {
+        decision.apply_measured_profile(
+            &calibration.profile,
+            calibration.effective_tokens_per_second,
+        );
+    }
+    Ok((snapshot, decision))
+}
+
 fn persist_decision(
     database: &Path,
     snapshot: &HardwareSnapshot,
     decision: &PlanningDecision,
-) -> Result<()> {
+) -> Result<(i64, i64)> {
     let store = Store::open(database)?;
     let snapshot_id = store.insert_snapshot(snapshot)?;
-    store.insert_planning_decision(snapshot_id, decision)?;
-    Ok(())
+    let decision_id = store.insert_planning_decision(snapshot_id, decision)?;
+    Ok((snapshot_id, decision_id))
 }
 
 fn capture() -> Result<HardwareSnapshot> {
@@ -334,7 +513,12 @@ fn print_decision(decision: &PlanningDecision, show_candidates: bool) {
     println!("Candidates: {}", decision.candidates.len());
     println!("Selection basis: {}", decision.selection_basis);
     println!("Calibration required: {}", decision.calibration_required);
-    print_profile("Selected baseline", &decision.selected);
+    let label = if decision.calibration_required {
+        "Selected baseline"
+    } else {
+        "Selected measured profile"
+    };
+    print_profile(label, &decision.selected);
     for note in &decision.notes {
         println!("- {note}");
     }
@@ -371,6 +555,71 @@ fn print_profile(label: &str, profile: &ExecutionProfile) {
     } else {
         println!("- Estimated memory: incomplete");
     }
+}
+
+fn print_inference_result(result: &InferenceResult) {
+    println!("Backend: {}", result.backend);
+    println!("Model: {}", result.model);
+    println!("Response: {}", result.response);
+    if let Some(reasoning) = &result.reasoning
+        && !reasoning.is_empty()
+    {
+        println!("Reasoning: {reasoning}");
+    }
+    println!(
+        "Tokens: {} prompt, {} generated, {} total",
+        result.usage.prompt_tokens, result.usage.completion_tokens, result.usage.total_tokens
+    );
+    if let Some(timings) = &result.timings {
+        println!(
+            "Throughput: {:.2} prompt tokens/s, {:.2} generated tokens/s",
+            timings.prompt_per_second, timings.predicted_per_second
+        );
+    }
+    println!("Request wall time: {} ms", result.wall_time_ms);
+    println!("GPU telemetry samples: {}", result.gpu.sample_count);
+    if let Some(memory) = result.gpu.peak_memory_used_mib {
+        println!("Peak GPU memory: {memory:.0} MiB");
+    }
+    if let Some(utilization) = result.gpu.peak_utilization_percent {
+        println!("Peak GPU utilization: {utilization:.0}%");
+    }
+    if let Some(temperature) = result.gpu.peak_temperature_celsius {
+        println!("Peak GPU temperature: {temperature:.0} C");
+    }
+    if let Some(power) = result.gpu.average_power_watts {
+        println!("Average GPU power: {power:.1} W");
+    }
+}
+
+fn print_calibration(calibration: &CalibrationResult) {
+    println!("Selection basis: {}", calibration.selection_basis);
+    println!("Measured candidates: {}", calibration.runs.len());
+    for (index, run) in calibration.runs.iter().enumerate() {
+        let prompt_rate = run
+            .measurements
+            .iter()
+            .find(|measurement| measurement.n_prompt > 0)
+            .map(|measurement| measurement.avg_ts)
+            .unwrap_or_default();
+        let generation_rate = run
+            .measurements
+            .iter()
+            .find(|measurement| measurement.n_gen > 0)
+            .map(|measurement| measurement.avg_ts)
+            .unwrap_or_default();
+        println!(
+            "{}. effective {:.2} tokens/s, prompt {:.2}, generation {:.2}, {:?}, {} threads, batch {}",
+            index + 1,
+            run.effective_tokens_per_second,
+            prompt_rate,
+            generation_rate,
+            run.profile.gpu_placement,
+            run.profile.cpu_threads,
+            run.profile.batch_size
+        );
+    }
+    print_profile("Measured selection", &calibration.selected);
 }
 
 fn print_snapshot(snapshot: &HardwareSnapshot, json: bool) -> Result<()> {
@@ -439,6 +688,15 @@ fn default_database_path() -> PathBuf {
 
 fn display_optional_path(path: Option<&PathBuf>) -> String {
     path.map_or_else(|| "not found".into(), |path| path.display().to_string())
+}
+
+fn display_variant(variant: Option<LlamaCppVariant>) -> &'static str {
+    match variant {
+        Some(LlamaCppVariant::Cuda) => "CUDA",
+        Some(LlamaCppVariant::Vulkan) => "Vulkan",
+        Some(LlamaCppVariant::Other) => "other",
+        None => "not found",
+    }
 }
 
 fn display_optional_number(value: Option<u32>) -> String {

@@ -4,7 +4,8 @@ An experimental hardware-aware control plane for local AI inference engines.
 
 The first backend is `llama.cpp`. This project does not replace its tensor
 kernels or model support. It probes the host, records telemetry, recommends an
-execution profile, and will supervise inference processes through a stable API.
+execution profile, and supervises one-shot inference through its CLI. A stable
+serving API and deeper inference-engine components remain future milestones.
 
 ## Current milestone
 
@@ -15,7 +16,12 @@ execution profile, and will supervise inference processes through a stable API.
 - Memory feasibility checks for weights, KV cache, and compute buffers
 - Explicit `latency`, `throughput`, `efficiency`, and `balanced` objectives
 - `llama-server` and `llama-bench` discovery
+- CUDA-first discovery for packaged llama.cpp builds
 - Safe `llama-server` command construction
+- Supervised server startup, readiness checks, inference, and shutdown
+- NVIDIA memory, utilization, temperature, and power sampling during inference
+- Persisted inference results and telemetry
+- CUDA calibration sweeps across top scheduler candidates
 
 ## Build
 
@@ -44,8 +50,30 @@ cargo run -- plan-server \
   --prompt-tokens 512 \
   --output-tokens 256 \
   --concurrency 1
+cargo run -- infer \
+  --model /models/model.gguf \
+  --use-case interactive \
+  --goal balanced \
+  --prompt-tokens 64 \
+  --output-tokens 64 \
+  --prompt "Explain why GPU offload improves inference" \
+  --disable-thinking
+cargo run -- calibrate \
+  --model /models/model.gguf \
+  --use-case interactive \
+  --goal balanced \
+  --prompt-tokens 512 \
+  --output-tokens 128 \
+  --candidates 3 \
+  --repetitions 3
 cargo run -- snapshots --limit 5
 ```
+
+`recommend`, `plan-server`, and `infer` reuse the latest compatible calibration.
+A stored result is accepted only when the model metadata, workload, objective,
+CPU/GPU identity, and a currently memory-safe candidate all match. Otherwise
+the planner keeps its analytical baseline and reports that calibration is still
+required.
 
 When free GPU-memory telemetry is unavailable, pass an explicit available
 capacity to
@@ -80,8 +108,10 @@ directory. Override it for experiments:
 cargo run -- --database .runtime/test.db probe
 ```
 
-The backend binaries are discovered from `PATH`. They can also be supplied
-through `LLAMA_SERVER_PATH` and `LLAMA_BENCH_PATH`.
+The backend binaries are discovered from `PATH`. CUDA builds under the common
+`$XDG_DATA_HOME/llama.cpp/*-cuda` layout are preferred when present. Binaries
+can also be supplied explicitly through `LLAMA_SERVER_PATH` and
+`LLAMA_BENCH_PATH`.
 
 ## Scope
 

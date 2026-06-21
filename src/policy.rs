@@ -142,6 +142,42 @@ pub struct PlanningDecision {
     pub notes: Vec<String>,
 }
 
+impl PlanningDecision {
+    pub fn apply_measured_profile(
+        &mut self,
+        profile: &ExecutionProfile,
+        effective_tokens_per_second: f64,
+    ) -> bool {
+        if !effective_tokens_per_second.is_finite() || effective_tokens_per_second <= 0.0 {
+            return false;
+        }
+        let Some(index) = self
+            .candidates
+            .iter()
+            .position(|candidate| runtime_configuration_matches(candidate, profile))
+        else {
+            return false;
+        };
+
+        self.candidates.swap(0, index);
+        self.selected = self.candidates[0].clone();
+        self.selected.reasons.push(format!(
+            "selected by a compatible CUDA calibration measuring {effective_tokens_per_second:.2} effective tokens/s"
+        ));
+        self.selection_basis = format!(
+            "compatible measured CUDA calibration ({effective_tokens_per_second:.2} effective tokens/s)"
+        );
+        self.calibration_required = false;
+        self.notes
+            .retain(|note| !note.contains("selection is an analytical baseline"));
+        self.notes.insert(
+            0,
+            "stored calibration matched the current model, workload, hardware, and safe candidate set".into(),
+        );
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanningOverrides {
     pub gpu_memory_bytes: Option<u64>,
@@ -234,7 +270,7 @@ pub fn plan(
             .total_cmp(&left.planning_score)
             .then_with(|| left.cpu_threads.cmp(&right.cpu_threads))
     });
-    candidates.dedup_by(|left, right| same_configuration(left, right));
+    candidates.dedup_by(|left, right| runtime_configuration_matches(left, right));
 
     let selected = candidates[0].clone();
     let mut notes = vec![
@@ -578,7 +614,10 @@ fn candidate_reasons(
     reasons
 }
 
-fn same_configuration(left: &ExecutionProfile, right: &ExecutionProfile) -> bool {
+pub(crate) fn runtime_configuration_matches(
+    left: &ExecutionProfile,
+    right: &ExecutionProfile,
+) -> bool {
     left.cpu_threads == right.cpu_threads
         && left.gpu_placement == right.gpu_placement
         && left.context_size == right.context_size
@@ -755,5 +794,24 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("continuous resource-pressure"))
         );
+    }
+
+    #[test]
+    fn measured_profile_replaces_the_analytical_selection() {
+        let mut decision = plan(
+            &snapshot(),
+            model(),
+            workload(),
+            PlanningOverrides::default(),
+        )
+        .unwrap();
+        let measured = decision.candidates.last().unwrap().clone();
+
+        assert!(decision.apply_measured_profile(&measured, 42.5));
+
+        assert_eq!(decision.selected.cpu_threads, measured.cpu_threads);
+        assert_eq!(decision.selected.gpu_placement, measured.gpu_placement);
+        assert!(!decision.calibration_required);
+        assert!(decision.selection_basis.contains("42.50"));
     }
 }
